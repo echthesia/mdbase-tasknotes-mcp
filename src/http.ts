@@ -13,7 +13,7 @@ import type { OAuthTokenVerifier } from "@modelcontextprotocol/sdk/server/auth/p
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { OAuthMetadata } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { createRemoteJWKSet, jwtVerify } from "jose";
-import { resolveCollectionPath } from "./config.js";
+import path from "node:path";
 import { createServerContext } from "./context.js";
 import { createServer } from "./server.js";
 
@@ -37,9 +37,12 @@ function requireEnv(name: string): string {
 // ---------------------------------------------------------------------------
 
 async function fetchOAuthMetadata(issuer: URL): Promise<OAuthMetadata> {
+  // Ensure trailing slash so .well-known paths resolve correctly for
+  // issuers with non-root paths (e.g., multi-tenant identity providers)
+  const base = issuer.href.endsWith("/") ? issuer : new URL(issuer.href + "/");
   const endpoints = [
-    new URL(".well-known/openid-configuration", issuer),
-    new URL(".well-known/oauth-authorization-server", issuer),
+    new URL(".well-known/openid-configuration", base),
+    new URL(".well-known/oauth-authorization-server", base),
   ];
 
   for (const endpoint of endpoints) {
@@ -49,11 +52,14 @@ async function fetchOAuthMetadata(issuer: URL): Promise<OAuthMetadata> {
       const res = await fetch(endpoint.toString(), {
         signal: controller.signal,
       });
-      clearTimeout(timeout);
 
-      if (!res.ok) continue;
+      if (!res.ok) {
+        clearTimeout(timeout);
+        continue;
+      }
 
       const metadata = (await res.json()) as OAuthMetadata;
+      clearTimeout(timeout);
 
       if (
         !metadata.issuer ||
@@ -131,7 +137,7 @@ function createTokenVerifier(
 
 async function main(): Promise<void> {
   // 1. Resolve collection path and create shared context
-  const collectionPath = resolveCollectionPath([]);
+  const collectionPath = path.resolve(requireEnv("MDBASE_TASKNOTES_PATH"));
   const ctx = await createServerContext(collectionPath);
 
   // 2. Read config
@@ -164,21 +170,29 @@ async function main(): Promise<void> {
 
   const allowedOrigins = requireEnv("ALLOWED_ORIGINS")
     .split(",")
-    .map((o) => o.trim());
+    .map((o) => o.trim())
+    .filter(Boolean);
 
   // 3. Fetch OAuth metadata
   console.log(`Fetching OAuth metadata from ${issuerUrl}...`);
   const oauthMetadata = await fetchOAuthMetadata(issuerUrl);
   console.log(`OAuth metadata fetched. Issuer: ${oauthMetadata.issuer}`);
 
-  // 4. Extract jwks_uri
-  const jwksUriStr = (oauthMetadata as Record<string, unknown>)[
-    "jwks_uri"
-  ] as string | undefined;
-  if (!jwksUriStr) {
-    fatal("OAuth metadata does not contain jwks_uri");
+  // Validate issuer matches configured value
+  const expectedIssuer = issuerUrl.toString().replace(/\/$/, "");
+  const actualIssuer = oauthMetadata.issuer.replace(/\/$/, "");
+  if (expectedIssuer !== actualIssuer) {
+    fatal(
+      `Issuer mismatch: expected ${expectedIssuer}, got ${actualIssuer}`,
+    );
   }
-  const jwksUri = new URL(jwksUriStr);
+
+  // 4. Extract jwks_uri
+  const jwksUriRaw = (oauthMetadata as Record<string, unknown>)["jwks_uri"];
+  if (typeof jwksUriRaw !== "string") {
+    fatal("OAuth metadata does not contain a valid jwks_uri string");
+  }
+  const jwksUri = new URL(jwksUriRaw);
 
   // 5. Create token verifier
   const verifier = createTokenVerifier(
@@ -221,10 +235,19 @@ async function main(): Promise<void> {
   const sessionOwners: Record<string, string> = {};
   const allowedHosts = [serverUrl.host];
 
+  function getSessionId(req: express.Request): string | undefined {
+    const raw = req.headers["mcp-session-id"];
+    return Array.isArray(raw) ? raw[0] : raw;
+  }
+
   // 10. POST /mcp (authenticated)
   app.post("/mcp", authMiddleware, async (req, res) => {
-    const auth = req.auth as AuthInfo;
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const auth = req.auth as AuthInfo | undefined;
+    if (!auth?.clientId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const sessionId = getSessionId(req);
 
     if (sessionId && transports[sessionId]) {
       if (sessionOwners[sessionId] !== auth.clientId) {
@@ -238,6 +261,7 @@ async function main(): Promise<void> {
     }
 
     if (!sessionId && isInitializeRequest(req.body)) {
+      const server = createServer(ctx);
       const transport = new StreamableHTTPServerTransport({
         sessionIdGenerator: () => randomUUID(),
         onsessioninitialized: (sid) => {
@@ -248,6 +272,7 @@ async function main(): Promise<void> {
         onsessionclosed: (sid) => {
           delete transports[sid];
           delete sessionOwners[sid];
+          void server.close().catch(console.error);
           console.log(`Session ${sid} closed`);
         },
         enableDnsRebindingProtection: true,
@@ -255,7 +280,6 @@ async function main(): Promise<void> {
         allowedOrigins,
       });
 
-      const server = createServer(ctx);
       await server.connect(transport);
 
       await transport.handleRequest(req, res, req.body);
@@ -270,8 +294,12 @@ async function main(): Promise<void> {
 
   // 11. GET /mcp (authenticated) — SSE stream
   app.get("/mcp", authMiddleware, async (req, res) => {
-    const auth = req.auth as AuthInfo;
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const auth = req.auth as AuthInfo | undefined;
+    if (!auth?.clientId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const sessionId = getSessionId(req);
 
     if (!sessionId || !transports[sessionId]) {
       res.status(400).json({ error: "Invalid or missing session ID" });
@@ -288,8 +316,12 @@ async function main(): Promise<void> {
 
   // 12. DELETE /mcp (authenticated) — session termination
   app.delete("/mcp", authMiddleware, async (req, res) => {
-    const auth = req.auth as AuthInfo;
-    const sessionId = req.headers["mcp-session-id"] as string | undefined;
+    const auth = req.auth as AuthInfo | undefined;
+    if (!auth?.clientId) {
+      res.status(401).json({ error: "Authentication required" });
+      return;
+    }
+    const sessionId = getSessionId(req);
 
     if (!sessionId || !transports[sessionId]) {
       res.status(400).json({ error: "Invalid or missing session ID" });
@@ -304,25 +336,41 @@ async function main(): Promise<void> {
     await transports[sessionId]!.handleRequest(req, res);
   });
 
-  // 13. Start listening
-  app.listen(port, () => {
+  // 13. Error handler (prevent stack trace leakage)
+  app.use(
+    (
+      err: Error,
+      _req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction,
+    ) => {
+      console.error("Unhandled error:", err);
+      res.status(500).json({ error: "Internal server error" });
+    },
+  );
+
+  // 14. Start listening
+  const httpServer = app.listen(port, () => {
     console.log(`MCP HTTP server listening on port ${port}`);
     console.log(`Server URL: ${serverUrl}`);
     console.log(`Collection path: ${collectionPath}`);
     console.log(`Protected resource metadata: ${resourceMetadataUrl}`);
   });
 
-  // 14. Graceful shutdown
+  // 15. Graceful shutdown
   async function shutdown(signal: string): Promise<void> {
     console.log(`\n${signal} received, shutting down...`);
-    for (const [sid, transport] of Object.entries(transports)) {
-      console.log(`Closing session ${sid}`);
-      await transport.close();
-    }
+    httpServer.close();
+    await Promise.allSettled(
+      Object.entries(transports).map(async ([sid, transport]) => {
+        console.log(`Closing session ${sid}`);
+        await transport.close();
+      }),
+    );
     process.exit(0);
   }
-  process.on("SIGINT", () => shutdown("SIGINT"));
-  process.on("SIGTERM", () => shutdown("SIGTERM"));
+  process.on("SIGINT", () => void shutdown("SIGINT").catch(console.error));
+  process.on("SIGTERM", () => void shutdown("SIGTERM").catch(console.error));
 }
 
 main().catch((err) => {
